@@ -583,8 +583,6 @@ const App = (() => {
     const workouts = (await DB.all('workouts'));
     const done = workouts.filter(w => w.status === 'completed').sort((a, b) => b.startTime - a.startTime);
     const sets = await DB.all('sets');
-    const goals = await DB.all('goals');
-    const bw = (await DB.all('bodyweight')).sort((a, b) => a.ts - b.ts);
     const now = Date.now(), weekAgo = now - 7 * 86400000;
     const thisWeek = done.filter(w => w.startTime >= weekAgo);
     const active = workouts.find(w => w.status === 'active');
@@ -593,7 +591,6 @@ const App = (() => {
     const greet = h < 5 ? 'Late night' : h < 11 ? 'Guten Morgen' : h < 17 ? 'Servus' : h < 22 ? 'Guten Abend' : 'Late night';
     const streak = computeStreakWeeks(done);
     const trainedToday = done.some(w => w.date === today());
-    const weekVol = thisWeek.reduce((a, w) => a + (w.totalVolume || 0), 0);
     const weekSets = thisWeek.reduce((a, w) => a + (w.totalSets || 0), 0);
 
     // ---------- HERO ----------
@@ -609,26 +606,22 @@ const App = (() => {
           </div>
         </div>
         <div class="hero-stats">
-          <div><div class="hs-v num" data-count="${thisWeek.length}">0</div><div class="hs-k">Workouts / Woche</div></div>
+          <div><div class="hs-v num" data-count="${thisWeek.length}">0</div><div class="hs-k">Einheiten / Woche</div></div>
           <div><div class="hs-v num" data-count="${weekSets}">0</div><div class="hs-k">Sätze / Woche</div></div>
-          <div><div class="hs-v num" data-count="${streak}">0</div><div class="hs-k">Wochen-Streak ${streak > 0 ? '🔥' : ''}</div></div>
+          <div><div class="hs-v num" data-count="${streak}">0</div><div class="hs-k">Streak ${streak > 0 ? '🔥' : ''}</div></div>
         </div>
-        <div class="hero-status">${trainedToday
-          ? 'Heute schon trainiert — sauber. Noch eine Einheit?'
-          : (active ? 'Ein Workout läuft noch — mach da weiter.' : 'Noch nicht trainiert heute. Zeit, ranzugehen.')}</div>
+        <div class="consistency">${consistencyDots(done)}</div>
       </div>`;
 
     // ---------- PRIMARY ACTION ----------
-    if (active) {
-      html += `<button class="btn up block lg" onclick="App.resumeWorkout()" style="margin:4px 0 8px">▶ Laufendes Workout fortsetzen</button>`;
-    } else {
-      html += `<button class="btn up block lg" onclick="App.startWorkout()" style="margin:4px 0 8px">Workout starten</button>`;
-    }
+    html += active
+      ? `<button class="btn up block lg" onclick="App.resumeWorkout()" style="margin:4px 0 8px">▶ Laufendes Training fortsetzen</button>`
+      : `<button class="btn up block lg" onclick="App.go('training')" style="margin:4px 0 8px">Training starten</button>`;
     html += `<div class="quickrow">
         <button class="quick" onclick="App.openTemplates()"><span class="qi">▤</span>Vorlage</button>
         <button class="quick" onclick="App.openPlateCalc()"><span class="qi">◔</span>Scheiben</button>
         <button class="quick" onclick="App.openBodyweight()"><span class="qi">⚖</span>Gewicht</button>
-        <button class="quick" onclick="App.go('exercises')"><span class="qi">≣</span>Übungen</button>
+        <button class="quick" onclick="App.go('progress')"><span class="qi">≣</span>Progress</button>
       </div>`;
 
     // ---------- HEUTE & ZULETZT ----------
@@ -648,89 +641,54 @@ const App = (() => {
           ${last.prCount ? `<span class="pill pr">${last.prCount} PR</span>` : ''}
         </div></div>`;
     } else {
-      lastHtml = `<div class="muted tiny">Noch kein abgeschlossenes Workout.</div>`;
+      lastHtml = `<div class="muted tiny">Noch kein abgeschlossenes Training.</div>`;
     }
-    // simple "next" hint: most-neglected group this week
-    let nextHint = '';
     const under = DB.MUSCLE_GROUPS.filter(m => Logic.landmarkState(m, (Logic.setsPerMuscle(sets, S.exCache, weekAgo)[m] || 0)) === 'low');
+    let nextHint = '';
     if (done.length) nextHint = under.length
-      ? `Diese Woche zu kurz gekommen: <b>${under.map(m => DB.MG_LABEL[m]).join(', ')}</b>.`
+      ? `Nächster Fokus: <b>${under.slice(0, 3).map(m => DB.MG_LABEL[m]).join(', ')}</b> — diese Woche zu kurz gekommen.`
       : `Volumen diese Woche gut verteilt. Weiter so.`;
     html += `<div class="card"><div class="card-h"><span>Heute &amp; zuletzt</span></div>
-      <div class="tl-today">${trainedToday ? '✓ Heute trainiert' : '○ Heute noch offen'}</div>
+      <div class="tl-today">${trainedToday ? '✓ Heute trainiert' : (active ? '● Training läuft' : '○ Heute noch offen')}</div>
       ${lastHtml}
       ${nextHint ? `<div class="tl-next">↳ ${nextHint}</div>` : ''}</div>`;
 
-    // ---------- WEEKLY CHARTS (real data, last 8 weeks) ----------
-    const weekly = computeWeekly(done, 8);
-    html += `<div class="chart-card"><div class="ct"><span class="title">Einheiten / Woche</span><span class="now num">${thisWeek.length}</span></div>
-      ${Charts.bars(weekly.map(w => ({ label: w.label, value: w.sessions })), { emptyText: 'Noch keine Wochen-Daten' })}</div>`;
-    html += `<div class="chart-card"><div class="ct"><span class="title">Volumen / Woche</span><span class="now num">${fmtK(weekVol)} kg</span></div>
-      ${Charts.bars(weekly.map(w => ({ label: w.label, value: Math.round((w.volume || 0) / 1000) })), { emptyText: 'Noch keine Wochen-Daten' })}</div>
-      <div class="muted tiny" style="margin:-6px 4px 6px">Volumen in Tonnen (×1000 kg)</div>`;
-
-    // ---------- MUSCLE HEATMAP (this week) ----------
-    const spm = Logic.setsPerMuscle(sets, S.exCache, weekAgo);
-    const mrv = {}; for (const m in Logic.LANDMARKS) mrv[m] = Logic.LANDMARKS[m].mrv;
-    html += `<div class="card"><div class="card-h"><span>Muskel-Fokus · 7 Tage</span><span class="muted tiny">Sätze pro Gruppe</span></div>
-      ${Charts.bodyHeat(spm, mrv)}
-      ${landmarkBars(spm)}</div>`;
-
-    // ---------- TRAINING FREQUENCY HEATMAP ----------
-    const dayVol = {};
-    for (const w of done) dayVol[w.date] = (dayVol[w.date] || 0) + (w.totalVolume || 0);
-    html += `<div class="card"><div class="card-h"><span>Trainingsfrequenz · 12 Wochen</span></div>
-      <div class="heatwrap">${Charts.heatCalendar(dayVol, 12)}</div>
-      <div class="heatlegend"><span>weniger</span><i class="heat l0"></i><i class="heat l1"></i><i class="heat l2"></i><i class="heat l3"></i><i class="heat l4"></i><span>mehr</span></div></div>`;
-
-    // ---------- VOLUME TREND ----------
-    const volSeries = [...done].reverse().slice(-14).map(w => ({ x: w.startTime, y: w.totalVolume || 0 }));
-    html += `<div class="chart-card"><div class="ct"><span class="title">Volumen / Workout</span>${done.length ? `<span class="now num">${fmtK(done[0].totalVolume || 0)} kg</span>` : ''}</div>${Charts.line(volSeries, { emptyText: 'Nach dem ersten Workout erscheint hier deine Kurve' })}</div>`;
-
-    // ---------- KEY EXERCISE DEVELOPMENT (e1RM of most-trained lift) ----------
-    const usage = {}; sets.forEach(s => usage[s.exerciseId] = (usage[s.exerciseId] || 0) + 1);
-    const topId = Object.keys(usage).sort((a, b) => usage[b] - usage[a])[0];
-    if (topId && S.exCache[topId]) {
-      const wmap = {}; done.forEach(w => wmap[w.id] = w);
-      const series = Logic.exerciseSeries(sets.filter(s => s.exerciseId === topId), wmap);
-      if (series.length) {
-        html += `<div class="chart-card"><div class="ct"><span class="title">Entwicklung · ${esc(S.exCache[topId].name)}</span><span class="now num">${series[series.length - 1].e1rm} kg</span></div>${Charts.line(series.map(r => ({ x: r.date, y: r.e1rm })))}<div class="muted tiny" style="padding:2px 8px">geschätzter 1RM über Zeit</div></div>`;
-      }
-    }
-
-    // ---------- BODYWEIGHT (if logged) ----------
-    if (bw.length) {
-      const last = bw[bw.length - 1];
-      const series = bw.map(b => ({ x: b.ts, y: b.kg }));
-      html += `<div class="chart-card"><div class="ct"><span class="title">Körpergewicht</span><span class="now num">${last.kg} kg</span></div>${Charts.line(series)}</div>`;
-    }
-
-    // ---------- RECENT PRs ----------
-    const prs = Logic.recentPRs(sets, S.exCache, 4);
+    // ---------- CURRENT PRs (kurz) ----------
+    const prs = Logic.recentPRs(sets, S.exCache, 3);
     if (prs.length) {
-      html += `<h2 class="section">Neueste Rekorde</h2>`;
+      html += `<div class="row between" style="margin:22px 4px 10px"><h2 class="section" style="margin:0">Aktuelle Rekorde</h2><button class="link-more" onclick="App.go('progress')">alle ›</button></div>`;
       for (const p of prs) html += `<div class="pr-row">
         <div class="pr-badge">🏆</div>
         <div class="stack"><div style="font-weight:700">${esc(p.name)}</div><div class="muted tiny">${esc(p.kind)} · ${dateLabel(new Date(p.when).toISOString().slice(0,10))}</div></div>
         <div class="num pr-val">${p.weight}×${p.reps}</div></div>`;
     }
 
-    // ---------- GOALS ----------
-    if (goals.length) {
-      html += `<h2 class="section">Ziele</h2>`;
-      for (const g of goals) html += goalCard(g);
-    }
-
-    // ---------- RECENT WORKOUTS ----------
-    html += `<h2 class="section">Letzte Workouts</h2>`;
+    // ---------- RECENT WORKOUTS (kurz) ----------
+    html += `<div class="row between" style="margin:22px 4px 10px"><h2 class="section" style="margin:0">Letzte Einheiten</h2>${done.length > 3 ? `<button class="link-more" onclick="App.go('progress')">Verlauf ›</button>` : ''}</div>`;
     if (!done.length) {
-      html += `<div class="empty"><div class="big">Bereit für Workout #1</div>${Object.keys(S.exCache).length} Übungen liegen bereit. Starte oben — alles wird lokal gespeichert.</div>`;
+      html += `<div class="empty"><div class="big">Bereit für Einheit #1</div>${Object.keys(S.exCache).length} Übungen liegen bereit. Starte oben — alles bleibt lokal auf dem Gerät.</div>`;
     } else {
-      for (const w of done.slice(0, 6)) html += workoutRow(w);
+      for (const w of done.slice(0, 3)) html += workoutRow(w);
     }
 
     $('view-home').innerHTML = html;
     runCountUps();
+  }
+
+  // 7-day consistency dots (trained / rest)
+  function consistencyDots(done) {
+    const set = new Set(done.map(w => w.date));
+    const days = ['M', 'D', 'M', 'D', 'F', 'S', 'S'];
+    const mon = new Date(); mon.setHours(0, 0, 0, 0); mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7));
+    let out = '';
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(mon); d.setDate(mon.getDate() + i);
+      const key = d.toISOString().slice(0, 10);
+      const isToday = key === today();
+      const on = set.has(key);
+      out += `<div class="cd ${on ? 'on' : ''} ${isToday ? 'today' : ''}"><span></span><i>${days[i]}</i></div>`;
+    }
+    return out;
   }
 
   // sets-per-muscle balance bars vs MEV/MAV/MRV landmarks
@@ -1418,8 +1376,12 @@ const App = (() => {
 
     const weekly = computeWeekly(done, 8);
     const volSeries = [...workouts].sort((a, b) => a.startTime - b.startTime).map(w => ({ x: w.startTime, y: w.totalVolume || 0 }));
+    const weekVol = workouts.filter(w => w.startTime >= weekAgo).reduce((a, w) => a + (w.totalVolume || 0), 0);
     const spm = Logic.setsPerMuscle(sets, S.exCache, weekAgo);
-    const barItems = DB.MUSCLE_GROUPS.filter(m => spm[m]).map(m => ({ label: DB.MG_LABEL[m].slice(0, 3), value: spm[m] }));
+    const mrv = {}; for (const m in Logic.LANDMARKS) mrv[m] = Logic.LANDMARKS[m].mrv;
+    const bw = (await DB.all('bodyweight')).sort((a, b) => a.ts - b.ts);
+    const goals = await DB.all('goals');
+    const dayVol = {}; for (const w of done) dayVol[w.date] = (dayVol[w.date] || 0) + (w.totalVolume || 0);
 
     const usage = {}; sets.forEach(s => usage[s.exerciseId] = (usage[s.exerciseId] || 0) + 1);
     const topEx = Object.values(S.exCache).filter(e => usage[e.id]).sort((a, b) => usage[b.id] - usage[a.id]);
@@ -1437,21 +1399,46 @@ const App = (() => {
       } else exCharts += '<div class="muted tiny">Noch keine Daten.</div>';
     }
 
+    // empty state — no fake stats
+    if (!done.length) {
+      $('view-progress').innerHTML = `<div class="empty" style="padding:60px 20px">
+        <div class="big">Noch keine Trainingsdaten</div>
+        Sobald du dein erstes Training abschließt, erscheinen hier deine echten Charts:
+        Volumen, Frequenz, Muskel-Balance und die Entwicklung jeder Übung.
+        <div style="margin-top:18px"><button class="btn up" onclick="App.go('training')">Erstes Training starten</button></div></div>`;
+      return;
+    }
+
     let history = `<h2 class="section">Verlauf</h2>`;
-    if (!done.length) history += `<div class="empty"><div class="big">Noch kein Verlauf</div>Abgeschlossene Workouts erscheinen hier.</div>`;
-    else for (const w of done.slice(0, 20)) history += workoutRow(w);
+    for (const w of done.slice(0, 30)) history += workoutRow(w);
+
+    const goalsHtml = goals.length ? `<h2 class="section">Ziele</h2>${goals.map(goalCard).join('')}` : '';
+    const bwHtml = bw.length
+      ? `<div class="chart-card"><div class="ct"><span class="title">Körpergewicht</span><span class="now num">${bw[bw.length - 1].kg} kg</span></div>${Charts.line(bw.map(b => ({ x: b.ts, y: b.kg })))}</div>`
+      : '';
 
     $('view-progress').innerHTML = `
       <div class="metric-grid">
-        <div class="metric"><div class="k">Workouts gesamt</div><div class="v num">${workouts.length}</div></div>
+        <div class="metric"><div class="k">Einheiten gesamt</div><div class="v num">${workouts.length}</div></div>
         <div class="metric"><div class="k">Diese Woche</div><div class="v num">${weekWorkouts}</div></div>
         <div class="metric"><div class="k">Volumen gesamt</div><div class="v num">${fmtK(totalVol)}</div><div class="d muted">kg</div></div>
         <div class="metric"><div class="k">Wochen-Streak</div><div class="v num">${streak}</div><div class="d muted">Wochen in Folge</div></div>
       </div>
+
+      <div class="card"><div class="card-h"><span>Muskel-Balance · 7 Tage</span><span class="muted tiny">Sätze pro Gruppe</span></div>
+        ${Charts.bodyHeat(spm, mrv)}
+        ${landmarkBars(spm)}</div>
+
+      <div class="card"><div class="card-h"><span>Trainingsfrequenz · 12 Wochen</span></div>
+        <div class="heatwrap">${Charts.heatCalendar(dayVol, 12)}</div>
+        <div class="heatlegend"><span>weniger</span><i class="heat l0"></i><i class="heat l1"></i><i class="heat l2"></i><i class="heat l3"></i><i class="heat l4"></i><span>mehr</span></div></div>
+
       <div class="chart-card"><div class="ct"><span class="title">Einheiten / Woche</span></div>${Charts.bars(weekly.map(w => ({ label: w.label, value: w.sessions })))}</div>
+      <div class="chart-card"><div class="ct"><span class="title">Volumen / Woche</span><span class="now num">${fmtK(weekVol)} kg</span></div>${Charts.bars(weekly.map(w => ({ label: w.label, value: Math.round((w.volume || 0) / 1000) })))}<div class="muted tiny" style="padding:2px 8px">in Tonnen (×1000 kg)</div></div>
       <div class="chart-card"><div class="ct"><span class="title">Volumen / Workout</span></div>${Charts.line(volSeries)}</div>
-      <div class="chart-card"><div class="ct"><span class="title">Sätze / Muskelgruppe · 7 Tage</span></div>${Charts.bars(barItems)}</div>
       ${exCharts}
+      ${bwHtml}
+      ${goalsHtml}
       ${history}`;
   }
   function setStatsEx(id) { statsEx = id; renderProgress(); }
