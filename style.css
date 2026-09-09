@@ -110,6 +110,14 @@ h2.section { font-size: 12px; font-weight: 800; color: var(--text-2); text-trans
 .hs-v { font-family: var(--num); font-size: 26px; font-weight: 700; color: var(--text); text-shadow: var(--glow-soft); }
 .hs-k { font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: .06em; margin-top: 2px; }
 .hero-status { position: relative; z-index: 1; font-size: 13px; color: var(--text-2); border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.consistency { position: relative; z-index: 1; display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 14px; border-top: 1px solid var(--line-soft); padding-top: 12px; }
+.cd { display: flex; flex-direction: column; align-items: center; gap: 5px; }
+.cd span { width: 100%; max-width: 30px; aspect-ratio: 1; border-radius: 8px; background: var(--surface-3); border: 1px solid var(--line-soft); }
+.cd.on span { background: var(--up); box-shadow: var(--glow-soft); border-color: transparent; }
+.cd.today span { outline: 2px solid var(--up); outline-offset: 2px; }
+.cd i { font-style: normal; font-size: 10px; color: var(--text-3); font-weight: 700; }
+.cd.on i { color: var(--up); }
+.link-more { color: var(--up); font-size: 12px; font-weight: 800; letter-spacing: .04em; padding: 4px 2px; }
 
 .reactor { width: 48px; height: 48px; border-radius: 50%; flex: 0 0 auto; position: relative;
   border: 2px solid rgba(46,229,140,.35); display: grid; place-items: center; }
