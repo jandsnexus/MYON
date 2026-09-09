@@ -49,9 +49,9 @@ button { cursor: pointer; border: none; background: none; }
 
 #app { max-width: var(--appw); margin: 0 auto; min-height: 100dvh;
   padding: calc(var(--safe-t) + 6px) 16px calc(var(--safe-b) + 92px); }
-.view { display: none; animation: fade .18s ease; }
-.view.active { display: block; }
-@keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.view { display: none; }
+.view.active { display: block; animation: viewin .24s cubic-bezier(.2,.8,.2,1); }
+@keyframes viewin { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 .card { position: relative; background: linear-gradient(180deg, rgba(23,57,42,.45), var(--surface));
   border: 1px solid var(--line-soft); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
@@ -153,6 +153,43 @@ h2.section { font-size: 12px; font-weight: 800; color: var(--text-2); text-trans
 .lm-cap { margin-top: 10px; }
 
 .bodyheat { width: 100%; height: auto; max-height: 220px; display: block; margin: 4px auto; }
+
+/* interactive anatomical muscle map */
+.anat-card { padding-bottom: 12px; }
+.fb-switch { display: inline-flex; background: var(--surface-3); border: 1px solid var(--line-soft); border-radius: 999px; padding: 3px; gap: 2px; }
+.fb { padding: 6px 16px; border-radius: 999px; font-size: 12px; font-weight: 800; letter-spacing: .04em; color: var(--text-2); transition: color .18s, background .18s; }
+.fb.active { background: var(--up); color: #04120C; box-shadow: var(--glow-soft); }
+.fb:active { transform: scale(.95); }
+.anat-wrap { display: flex; justify-content: center; padding: 6px 0 2px; transition: opacity .13s ease, transform .13s ease; }
+.anat-wrap.swap { opacity: 0; transform: translateY(4px); }
+.anat-svg { width: auto; height: 300px; max-width: 100%; display: block; }
+.anat-body * { fill: var(--surface-2); stroke: rgba(70,230,160,.16); stroke-width: 1.2; }
+.anat-m .m { stroke: rgba(70,230,160,.5); stroke-width: 1; transition: fill-opacity .3s ease, filter .2s ease; cursor: pointer; }
+.anat-m .m.t0 { stroke: rgba(143,182,162,.25); }
+.anat-m .m.t3 { filter: drop-shadow(0 0 3px rgba(46,229,140,.5)); }
+.anat-m .m.t4 { filter: drop-shadow(0 0 6px rgba(46,229,140,.75)); }
+.anat-m .m:active { fill-opacity: .95; }
+.anat-m .m.sel { stroke: var(--pr); stroke-width: 1.6; filter: drop-shadow(0 0 6px rgba(255,194,75,.6)); }
+.anat-cap { text-align: center; margin-top: 4px; }
+
+/* muscle detail sheet */
+.ms-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+.ms-head h3 { margin: 0; }
+.ms-grp { font-size: 12px; color: var(--text-2); }
+.ms-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }
+.ms-stats > div { background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: 12px; padding: 12px 8px; text-align: center; }
+.ms-v { font-size: 24px; font-weight: 700; color: var(--text); }
+.ms-v.tr-up { color: var(--up); } .ms-v.tr-down { color: var(--down); } .ms-v.tr-flat { color: var(--text-2); }
+.ms-k { font-size: 10px; color: var(--text-2); text-transform: uppercase; letter-spacing: .06em; margin-top: 3px; }
+.ms-row { display: flex; justify-content: space-between; padding: 12px 0; border-top: 1px solid var(--line-soft); font-size: 14px; color: var(--text-2); }
+.ms-row b { color: var(--text); }
+
+/* micro-interaction: just-saved set flash */
+.set-line.justsaved { animation: savedflash .6s ease; }
+@keyframes savedflash {
+  0% { background: var(--up-dim); border-color: var(--up); transform: translateY(-2px); }
+  100% { transform: none; }
+}
 .bodyheat .sil * { fill: none; stroke: rgba(143,182,162,.35); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round; }
 .bodyheat .sil circle { fill: rgba(143,182,162,.08); }
 .bodyheat .bh { fill: var(--up); }
@@ -200,7 +237,8 @@ svg.chart { width: 100%; height: auto; display: block; }
   background: linear-gradient(rgba(8,26,18,.55), rgba(4,18,12,.92)); backdrop-filter: blur(22px) saturate(140%);
   border-top: 1px solid var(--line-soft); box-shadow: 0 -1px 0 rgba(46,229,140,.1); }
 .tabbar button { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 6px 0; color: var(--text-3);
-  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; border-radius: 12px; }
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; border-radius: 12px; transition: color .18s, transform .08s; }
+.tabbar button:active { transform: scale(.9); }
 .tabbar button .ic { width: 24px; height: 24px; stroke: currentColor; fill: none; stroke-width: 2; }
 .tabbar button.active { color: var(--up); }
 .tabbar button.active .ic { filter: drop-shadow(0 0 6px rgba(46,229,140,.6)); }
