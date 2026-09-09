@@ -500,6 +500,97 @@ const Charts = (() => {
   return { line, bars, ring, heatCalendar, bodyHeat };
 })();
 
+/* ---- ANATOMY: interactive muscle map (front/back SVG) ---- */
+const Anatomy = (() => {
+  // region -> { label, group (coarse data group), f (intensity factor) }
+  const REGION = {
+    chest:      { label: 'Brust', group: 'chest' },
+    front_delt: { label: 'Vordere Schulter', group: 'shoulders' },
+    side_delt:  { label: 'Seitliche Schulter', group: 'shoulders' },
+    rear_delt:  { label: 'Hintere Schulter', group: 'shoulders' },
+    biceps:     { label: 'Bizeps', group: 'biceps' },
+    triceps:    { label: 'Trizeps', group: 'triceps' },
+    forearm:    { label: 'Unterarme', group: 'biceps', f: 0.5 },
+    abs:        { label: 'Bauch', group: 'core' },
+    quad:       { label: 'Quadrizeps', group: 'legs' },
+    hamstring:  { label: 'Beinbeuger', group: 'legs' },
+    glute:      { label: 'Glutes', group: 'legs' },
+    calf:       { label: 'Waden', group: 'legs' },
+    lat:        { label: 'Latissimus', group: 'back' },
+    trap:       { label: 'Trapez', group: 'back' },
+    lower_back: { label: 'Unterer Rücken', group: 'back' },
+  };
+
+  // base body silhouette (shared front/back) — soft overlapping shapes
+  const BODY = `
+    <circle cx="100" cy="30" r="19"/>
+    <path d="M90 47 h20 v10 h-20 Z"/>
+    <path d="M72 84 C72 80 128 80 128 84 C137 112 131 142 126 154 C124 182 132 198 130 214 C130 222 70 222 70 214 C68 198 76 182 74 154 C69 142 63 112 72 84 Z"/>
+    <path d="M60 86 C50 88 46 96 46 110 C46 140 46 170 48 190 C49 198 59 198 60 190 C62 170 63 140 63 112 C63 98 66 88 60 86 Z"/>
+    <path d="M140 86 C150 88 154 96 154 110 C154 140 154 170 152 190 C151 198 141 198 140 190 C138 170 137 140 137 112 C137 98 134 88 140 86 Z"/>
+    <path d="M96 216 C86 214 80 224 80 244 C80 304 80 362 84 402 C85 412 95 412 96 402 C99 362 99 304 98 248 C98 228 100 218 96 216 Z"/>
+    <path d="M104 216 C114 214 120 224 120 244 C120 304 120 362 116 402 C115 412 105 412 104 402 C101 362 101 304 102 248 C102 228 100 218 104 216 Z"/>`;
+
+  // paired muscles are authored on the LEFT (x<100) and mirrored to the right.
+  const FRONT_PAIRED = {
+    front_delt: 'M62 84 C54 84 50 92 52 100 C60 102 68 98 68 90 C68 86 66 84 62 84 Z',
+    side_delt:  'M52 92 C45 94 43 106 48 116 C55 116 59 106 57 98 C56 94 55 92 52 92 Z',
+    chest:      'M97 100 C85 97 73 99 66 107 C63 114 69 124 80 126 C90 128 97 122 97 114 Z',
+    biceps:     'M50 118 C44 122 44 140 49 156 C56 157 60 148 58 133 C57 125 54 120 50 118 Z',
+    forearm:    'M49 158 C44 162 44 180 49 194 C55 195 58 186 56 171 C55 163 52 160 49 158 Z',
+    quad:       'M97 226 C84 224 75 240 77 268 C79 292 88 301 96 299 C98 279 98 250 97 232 C97 228 97 226 97 226 Z',
+    calf:       'M94 320 C87 320 82 334 84 356 C86 372 92 374 95 370 C97 354 97 334 96 324 C96 321 95 320 94 320 Z',
+  };
+  const FRONT_CENTRAL = {
+    abs: 'M89 133 h9 v15 h-9 Z M102 133 h9 v15 h-9 Z M89 151 h9 v15 h-9 Z M102 151 h9 v15 h-9 Z M89 169 h9 v15 h-9 Z M102 169 h9 v15 h-9 Z M91 187 C91 200 109 200 109 187 L108 187 C108 198 92 198 92 187 Z',
+  };
+  const BACK_PAIRED = {
+    rear_delt: 'M60 86 C52 86 48 94 51 102 C59 104 67 100 66 92 C66 88 64 86 60 86 Z',
+    lat:       'M96 124 L75 121 C69 133 68 151 75 167 C81 180 89 188 95 188 C96 170 97 148 96 124 Z',
+    triceps:   'M50 118 C44 122 44 140 49 156 C56 157 60 148 58 133 C57 125 54 120 50 118 Z',
+    forearm:   'M49 158 C44 162 44 180 49 194 C55 195 58 186 56 171 C55 163 52 160 49 158 Z',
+    glute:     'M97 216 C87 214 79 224 80 238 C81 250 91 254 98 250 C100 240 100 226 98 218 Z',
+    hamstring: 'M96 254 C88 252 81 264 82 288 C83 308 89 316 96 314 C98 296 98 272 97 258 Z',
+    calf:      'M94 320 C87 320 82 334 84 356 C86 372 92 374 95 370 C97 354 97 334 96 324 C96 321 95 320 94 320 Z',
+  };
+  const BACK_CENTRAL = {
+    trap:       'M100 76 C88 78 80 86 78 98 C86 105 95 107 100 107 C105 107 114 105 122 98 C120 86 112 78 100 76 Z',
+    lower_back: 'M91 188 C91 184 109 184 109 188 L108 210 C108 216 92 216 92 210 Z',
+  };
+
+  function intensity(region, spm) {
+    const m = REGION[region]; if (!m) return 0;
+    const L = (typeof Logic !== 'undefined') && Logic.LANDMARKS[m.group];
+    const mrv = L ? L.mrv : 20;
+    const v = (spm[m.group] || 0) * (m.f || 1);
+    return Math.max(0, Math.min(1, v / mrv));
+  }
+  const tier = (i) => i <= 0 ? 0 : i < .25 ? 1 : i < .5 ? 2 : i < .75 ? 3 : 4;
+
+  function musclePath(region, d, spm, mirror) {
+    const i = intensity(region, spm);
+    const op = i <= 0 ? 0 : (0.18 + i * 0.72);
+    const t = tier(i);
+    const tr = mirror ? ' transform="matrix(-1 0 0 1 200 0)"' : '';
+    return `<path class="m t${t}" data-m="${region}"${tr} d="${d}" fill="var(--up)" fill-opacity="${op.toFixed(2)}" onclick="App.muscleTap('${region}')"/>`;
+  }
+
+  function svg(view, spm) {
+    spm = spm || {};
+    const paired = view === 'back' ? BACK_PAIRED : FRONT_PAIRED;
+    const central = view === 'back' ? BACK_CENTRAL : FRONT_CENTRAL;
+    let m = '';
+    for (const id in paired) { m += musclePath(id, paired[id], spm, false); m += musclePath(id, paired[id], spm, true); }
+    for (const id in central) m += musclePath(id, central[id], spm, false);
+    return `<svg class="anat-svg" viewBox="0 0 200 430" preserveAspectRatio="xMidYMid meet" role="img">
+      <g class="anat-body">${BODY}</g>
+      <g class="anat-m">${m}</g>
+    </svg>`;
+  }
+
+  return { REGION, svg, intensity };
+})();
+
 /* ---- APP: UI controller + live workout ---- */
 const App = (() => {
   const $ = (id) => document.getElementById(id);
@@ -518,6 +609,8 @@ const App = (() => {
     startFromTemplate: null,
     suggestByEx: {},       // exId -> overload suggestion
     lastByEx: {},          // exId -> { sets:[...], ts } from last session
+    bodyView: 'front',
+    anatSpm: {},
     settings: { name: 'Sam', haptics: true, sound: false },
   };
 
@@ -624,6 +717,10 @@ const App = (() => {
         <button class="quick" onclick="App.go('progress')"><span class="qi">≣</span>Progress</button>
       </div>`;
 
+    // ---------- MUSCLE HEATMAP (interactive, hero visual) ----------
+    const spmHome = Logic.setsPerMuscle(sets, S.exCache, weekAgo);
+    html += muscleMapHTML(spmHome);
+
     // ---------- HEUTE & ZULETZT ----------
     const last = done[0];
     let lastHtml;
@@ -690,6 +787,58 @@ const App = (() => {
     }
     return out;
   }
+
+  // ---- interactive anatomical muscle map (Home + Progress) ----
+  function muscleMapHTML(spm) {
+    S.anatSpm = spm || {};
+    const empty = !Object.values(S.anatSpm).some(v => v > 0);
+    return `<div class="card anat-card"><div class="card-h"><span>Muskel-Heatmap · 7 Tage</span>
+        <div class="fb-switch">
+          <button class="fb ${S.bodyView === 'front' ? 'active' : ''}" onclick="App.setBodyView('front')">Front</button>
+          <button class="fb ${S.bodyView === 'back' ? 'active' : ''}" onclick="App.setBodyView('back')">Back</button>
+        </div></div>
+      <div class="anat-wrap" id="anatSvgWrap">${Anatomy.svg(S.bodyView, S.anatSpm)}</div>
+      <div class="anat-cap muted tiny">${empty ? 'Noch keine Trainingsdaten — trainiere, um deine Heatmap zu füllen.' : 'Tippe einen Muskel für Details. Farbe = Volumen der letzten 7 Tage.'}</div></div>`;
+  }
+  function setBodyView(v) {
+    if (S.bodyView === v) return;
+    S.bodyView = v; vibrate(6);
+    document.querySelectorAll('.fb-switch .fb').forEach(b => b.classList.toggle('active', b.textContent.toLowerCase() === (v === 'front' ? 'front' : 'back')));
+    const wrap = $('anatSvgWrap'); if (!wrap) return;
+    wrap.classList.add('swap');
+    setTimeout(() => { wrap.innerHTML = Anatomy.svg(v, S.anatSpm); wrap.classList.remove('swap'); }, 130);
+  }
+  async function muscleTap(region) {
+    const meta = Anatomy.REGION[region]; if (!meta) return;
+    vibrate(8);
+    await loadExCache();
+    const group = meta.group;
+    const gsets = (await DB.all('sets')).filter(s => Logic.isWorking(s) && (S.exCache[s.exerciseId] || {}).muscleGroup === group);
+    // highlight tapped muscle
+    document.querySelectorAll('.anat-m .m').forEach(p => p.classList.toggle('sel', p.getAttribute('data-m') === region));
+    if (!gsets.length) {
+      openSheet(`<div class="grab"></div><div class="ms-head"><h3>${meta.label}</h3><span class="ms-grp">${DB.MG_LABEL[group] || ''}</span></div>
+        <div class="empty" style="padding:26px 10px">Noch keine Daten für ${DB.MG_LABEL[group] || meta.label}.
+        <div style="margin-top:14px"><button class="btn up" onclick="App.closeSheetGo('training')">Training starten</button></div></div>`);
+      return;
+    }
+    const now = Date.now();
+    const s7 = gsets.filter(s => s.timestamp >= now - 7 * 86400000).length;
+    const last = Math.max(...gsets.map(s => s.timestamp));
+    const cur = gsets.filter(s => s.timestamp >= now - 14 * 86400000).length;
+    const prev = gsets.filter(s => s.timestamp >= now - 28 * 86400000 && s.timestamp < now - 14 * 86400000).length;
+    const trend = cur > prev ? '↑' : cur < prev ? '↓' : '→';
+    const L = Logic.LANDMARKS[group];
+    openSheet(`<div class="grab"></div><div class="ms-head"><h3>${meta.label}</h3><span class="ms-grp">${DB.MG_LABEL[group] || ''}</span></div>
+      <div class="ms-stats">
+        <div><div class="ms-v num">${s7}</div><div class="ms-k">Sätze · 7 T</div></div>
+        <div><div class="ms-v num">${gsets.length}</div><div class="ms-k">Sätze gesamt</div></div>
+        <div><div class="ms-v num tr-${trend === '↑' ? 'up' : trend === '↓' ? 'down' : 'flat'}">${trend}</div><div class="ms-k">Trend 2 Wo.</div></div>
+      </div>
+      <div class="ms-row">Zuletzt trainiert <b>${dateLabel(new Date(last).toISOString().slice(0, 10))}</b></div>
+      ${L ? `<div class="ms-row">Produktives Volumen <b>${L.mav[0]}–${L.mav[1]} Sätze/Woche</b></div>` : ''}`);
+  }
+  function closeSheetGo(v) { closeSheet(); go(v); }
 
   // sets-per-muscle balance bars vs MEV/MAV/MRV landmarks
   function landmarkBars(spm) {
@@ -992,6 +1141,9 @@ const App = (() => {
     startRest(en.setType === 'warmup' ? 45 : 120);
 
     refreshExSwitch(); refreshLiveBody();
+    const rows = document.querySelectorAll('#liveBody .set-line');
+    const lastRow = rows[rows.length - 1];
+    if (lastRow) { lastRow.classList.add('justsaved'); }
   }
 
   async function deleteSet(id) {
@@ -1425,9 +1577,8 @@ const App = (() => {
         <div class="metric"><div class="k">Wochen-Streak</div><div class="v num">${streak}</div><div class="d muted">Wochen in Folge</div></div>
       </div>
 
-      <div class="card"><div class="card-h"><span>Muskel-Balance · 7 Tage</span><span class="muted tiny">Sätze pro Gruppe</span></div>
-        ${Charts.bodyHeat(spm, mrv)}
-        ${landmarkBars(spm)}</div>
+      ${muscleMapHTML(spm)}
+      <div class="card"><div class="card-h"><span>Volumen-Balance · 7 Tage</span><span class="muted tiny">MEV / MAV / MRV</span></div>${landmarkBars(spm)}</div>
 
       <div class="card"><div class="card-h"><span>Trainingsfrequenz · 12 Wochen</span></div>
         <div class="heatwrap">${Charts.heatCalendar(dayVol, 12)}</div>
@@ -1743,10 +1894,11 @@ const App = (() => {
     addRest, skipRest, applySuggestion,
     openPlateCalc, calcPlates, openBodyweight, saveBodyweight,
     openSettings, saveSettings,
+    setBodyView, muscleTap, closeSheetGo,
   };
 })();
 
-window.DB = DB; window.Logic = Logic; window.Charts = Charts; window.App = App;
+window.DB = DB; window.Logic = Logic; window.Charts = Charts; window.Anatomy = Anatomy; window.App = App;
 if (document.readyState === 'loading')
   document.addEventListener('DOMContentLoaded', App.init);
 else App.init();
