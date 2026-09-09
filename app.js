@@ -517,6 +517,7 @@ const App = (() => {
     exCache: {},           // id -> exercise
     startFromTemplate: null,
     suggestByEx: {},       // exId -> overload suggestion
+    lastByEx: {},          // exId -> { sets:[...], ts } from last session
     settings: { name: 'Sam', haptics: true, sound: false },
   };
 
@@ -895,6 +896,15 @@ const App = (() => {
     const sets = S.setsByEx[S.curEx] || [];
     const hintHTML = renderHintHTML(S.curEx);
     const sug = S.suggestByEx[S.curEx];
+    const lastData = S.lastByEx[S.curEx];
+    let lastHTML = '';
+    if (lastData && lastData.sets.length) {
+      const when = dateLabel(new Date(lastData.ts).toISOString().slice(0, 10));
+      const chips = lastData.sets.map(s => `<span class="lt-set num">${s.weight}×${s.reps}<i>RIR ${s.rir}</i></span>`).join('');
+      lastHTML = `<div class="lasttime">
+        <div class="lt-h">LETZTES MAL · ${when}</div>
+        <div class="lt-sets">${chips}</div></div>`;
+    }
     const sugHTML = sug ? `<div class="hint sug">
       <svg class="ic" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg>
       <div class="txt"><b>Vorschlag: ${sug.weight} kg × ${sug.reps}</b> — ${esc(sug.text)}
@@ -918,6 +928,7 @@ const App = (() => {
     return `
       <div class="cur-ex-name">${esc(e.name)}</div>
       <div class="muted tiny">${DB.MG_LABEL[e.muscleGroup]} · Ziel ${e.defaultRepRange.min}–${e.defaultRepRange.max} Wdh.</div>
+      ${lastHTML}
       ${sugHTML}
       ${hintHTML}
       <div class="set-log">${logs || '<div class="muted tiny" style="padding:8px 2px">Noch keine Sätze — trag den ersten ein.</div>'}</div>
@@ -1644,6 +1655,8 @@ const App = (() => {
     const byW = {}; hist.forEach(s => (byW[s.workoutId] ||= []).push(s));
     const latest = Object.keys(byW).sort((a, b) =>
       Math.max(...byW[b].map(s => s.timestamp)) - Math.max(...byW[a].map(s => s.timestamp)))[0];
+    const lastSets = byW[latest].filter(Logic.isWorking).sort((a, b) => a.timestamp - b.timestamp);
+    S.lastByEx[id] = { sets: lastSets, ts: Math.max(...byW[latest].map(s => s.timestamp)) };
     S.suggestByEx[id] = Logic.overloadSuggestion(e, byW[latest]);
   }
   function applySuggestion() {
