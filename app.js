@@ -6,7 +6,7 @@
 /* ---- DB: IndexedDB layer ---- */
 const DB = (() => {
   const NAME = 'gymtracker';
-  const VERSION = 1;
+  const VERSION = 2;
   let _db = null;
 
   const uid = (p = '') =>
@@ -43,6 +43,10 @@ const DB = (() => {
         }
         if (!db.objectStoreNames.contains('meta')) {
           db.createObjectStore('meta', { keyPath: 'key' });
+        }
+        if (!db.objectStoreNames.contains('bodyweight')) {
+          const s = db.createObjectStore('bodyweight', { keyPath: 'id' });
+          s.createIndex('date', 'date', { unique: false });
         }
       };
       req.onsuccess = () => { _db = req.result; resolve(_db); };
@@ -127,14 +131,14 @@ const DB = (() => {
   // export / import (local-first backup — no cloud, so this matters)
   async function exportAll() {
     const data = {};
-    for (const s of ['exercises', 'workouts', 'sets', 'templates', 'goals', 'meta']) {
+    for (const s of ['exercises', 'workouts', 'sets', 'templates', 'goals', 'bodyweight', 'meta']) {
       data[s] = await all(s);
     }
     return { app: 'gymtracker', version: VERSION, exportedAt: Date.now(), data };
   }
   async function importAll(bundle, { merge = false } = {}) {
     const d = bundle.data || {};
-    for (const s of ['exercises', 'workouts', 'sets', 'templates', 'goals', 'meta']) {
+    for (const s of ['exercises', 'workouts', 'sets', 'templates', 'goals', 'bodyweight', 'meta']) {
       if (!merge) {
         await p(tx(s, 'readwrite').clear());
       }
@@ -273,10 +277,66 @@ const Logic = (() => {
     return out;
   }
 
+  // ---- Weekly volume landmarks (working sets / muscle / week) ------
+  // Rough hypertrophy guideposts (Israetel-style ranges). Not gospel —
+  // used to colour the balance bars: below MEV / in range / above MRV.
+  const LANDMARKS = {
+    chest:     { mev: 10, mav: [12, 20], mrv: 22 },
+    back:      { mev: 10, mav: [14, 22], mrv: 25 },
+    shoulders: { mev: 8,  mav: [16, 22], mrv: 26 },
+    legs:      { mev: 8,  mav: [12, 18], mrv: 20 },
+    biceps:    { mev: 8,  mav: [14, 20], mrv: 26 },
+    triceps:   { mev: 6,  mav: [10, 16], mrv: 18 },
+    core:      { mev: 0,  mav: [8, 16],  mrv: 20 },
+  };
+  function landmarkState(mg, sets) {
+    const L = LANDMARKS[mg]; if (!L) return 'ok';
+    if (sets < L.mev) return 'low';        // under maintenance
+    if (sets > L.mrv) return 'high';       // junk-volume territory
+    if (sets >= L.mav[0] && sets <= L.mav[1]) return 'opt'; // sweet spot
+    return 'ok';
+  }
+
+  // ---- Progressive-overload suggestion (pre-fill, never forced) ----
+  // Look at the best working set of the LAST session and, factoring RIR
+  // + the target rep range, propose the next set. User just confirms.
+  function overloadSuggestion(exercise, lastSessionSets) {
+    const range = exercise.defaultRepRange || { min: 8, max: 12 };
+    const working = (lastSessionSets || []).filter(isWorking);
+    if (!working.length) return null;
+    const top = working.reduce((b, s) => e1rm(s.weight, s.reps) > e1rm(b.weight, b.reps) ? s : b);
+    const inc = exercise.category === 'compound' ? 2.5 : 1.25;
+    let w = top.weight, r = top.reps, why;
+    if (r >= range.max && (top.rir ?? 2) <= 1) {
+      w = Math.round((top.weight + inc) * 2) / 2; r = range.min;
+      why = `Letztes Mal ${top.weight} kg × ${top.reps} bei RIR ${top.rir ?? '?'} — reif für ${w} kg.`;
+    } else if (r >= range.max) {
+      r = Math.min(range.max, top.reps + 1);
+      why = `Noch ${top.rir ?? '?'} im Tank — halte ${top.weight} kg, geh auf ${r} Wdh.`;
+    } else {
+      r = Math.min(range.max, top.reps + 1);
+      why = `Bau auf ${top.weight} kg auf: Ziel ${r} Wdh. Richtung oberes Ende (${range.max}).`;
+    }
+    return { weight: w, reps: r, rir: 2, text: why };
+  }
+
+  // ---- Recent PRs across everything (for the dashboard) ------------
+  function recentPRs(sets, exerciseMap, limit = 5) {
+    return sets.filter(s => s.prFlags && s.prFlags.length)
+      .sort((a, b) => b.timestamp - a.timestamp)
+      .slice(0, limit)
+      .map(s => ({
+        name: exerciseMap[s.exerciseId] ? exerciseMap[s.exerciseId].name : 'Übung',
+        weight: s.weight, reps: s.reps, when: s.timestamp,
+        kind: PR_LABEL[s.prFlags[0]], flags: s.prFlags,
+      }));
+  }
+
   return {
     e1rm, volume, isWorking, detectPRs, PR_LABEL,
     progressionHint, summarizeWorkout, bestSet,
     exerciseSeries, setsPerMuscle,
+    LANDMARKS, landmarkState, overloadSuggestion, recentPRs,
   };
 })();
 
@@ -353,7 +413,91 @@ const Charts = (() => {
     return Math.round(v * 10) / 10;
   }
 
-  return { line, bars };
+  // ---- Reactor ring (rest timer) ----------------------------------
+  function ring(remaining, total, warn) {
+    const R = 46, C = 2 * Math.PI * R;
+    const pct = total > 0 ? Math.max(0, Math.min(1, remaining / total)) : 0;
+    const off = C * (1 - pct);
+    const m = Math.floor(Math.max(0, remaining) / 60), s = Math.max(0, remaining) % 60;
+    const label = `${m}:${String(s).padStart(2, '0')}`;
+    return `<svg class="ring ${warn ? 'warn' : ''}" viewBox="0 0 120 120">
+      <circle class="ring-track" cx="60" cy="60" r="${R}"/>
+      <circle class="ring-glow" cx="60" cy="60" r="${R}"
+        stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"
+        transform="rotate(-90 60 60)"/>
+      <circle class="ring-prog" cx="60" cy="60" r="${R}"
+        stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}"
+        transform="rotate(-90 60 60)"/>
+      <text class="ring-label" x="60" y="66" text-anchor="middle">${label}</text>
+    </svg>`;
+  }
+
+  // ---- Contribution-style training heatmap ------------------------
+  // map: { 'YYYY-MM-DD': volume }. Draws `weeks` columns × 7 rows.
+  function heatCalendar(map, weeks = 12) {
+    const cell = 15, gap = 4, rows = 7;
+    const w = weeks * (cell + gap), h = rows * (cell + gap) + 4;
+    const today0 = new Date(); today0.setHours(0, 0, 0, 0);
+    // find max for bucketing
+    const vals = Object.values(map).filter(v => v > 0);
+    const max = vals.length ? Math.max(...vals) : 1;
+    const level = (v) => !v ? 0 : v >= max * 0.75 ? 4 : v >= max * 0.5 ? 3 : v >= max * 0.25 ? 2 : 1;
+    // start on Monday of the earliest visible week
+    const start = new Date(today0);
+    const dow = (start.getDay() + 6) % 7;          // 0 = Monday
+    start.setDate(start.getDate() - dow - (weeks - 1) * 7);
+    let cells = '';
+    for (let c = 0; c < weeks; c++) {
+      for (let r = 0; r < rows; r++) {
+        const d = new Date(start); d.setDate(start.getDate() + c * 7 + r);
+        if (d > today0) continue;
+        const key = d.toISOString().slice(0, 10);
+        const lv = level(map[key] || 0);
+        const x = c * (cell + gap), y = r * (cell + gap);
+        cells += `<rect class="heat l${lv}" x="${x}" y="${y}" width="${cell}" height="${cell}" rx="3"><title>${key}</title></rect>`;
+      }
+    }
+    return `<svg class="heatcal" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMinYMid meet">${cells}</svg>`;
+  }
+
+  // ---- Body heatmap (front + back silhouette) ---------------------
+  // volumes: { mg: workingSetsThisWeek }, mrv: { mg: number }
+  function bodyHeat(volumes, mrv) {
+    const intensity = (mg) => {
+      const v = volumes[mg] || 0, m = (mrv && mrv[mg]) || 20;
+      return Math.max(0, Math.min(1, v / m));
+    };
+    const spot = (cx, cy, r, mg) => {
+      const o = intensity(mg);
+      const fill = o <= 0 ? 0.05 : 0.15 + o * 0.85;
+      return `<circle class="bh" cx="${cx}" cy="${cy}" r="${r}" style="opacity:${fill.toFixed(2)}"><title>${mg}: ${volumes[mg] || 0} Sätze</title></circle>`;
+    };
+    // faint silhouette (front @x~60, back @x~180)
+    const fig = (ox) => `
+      <g class="sil" transform="translate(${ox},0)">
+        <circle cx="0" cy="16" r="9"/>
+        <path d="M-15 30 Q0 26 15 30 L20 40 L15 78 L8 78 L6 120 L-6 120 L-8 78 L-15 78 L-20 40 Z"/>
+        <path d="M-18 34 L-27 74 M18 34 L27 74"/>
+        <path d="M-6 120 L-8 165 M6 120 L8 165"/>
+      </g>`;
+    return `<svg class="bodyheat" viewBox="0 0 240 190" preserveAspectRatio="xMidYMid meet">
+      ${fig(60)}${fig(180)}
+      <!-- FRONT -->
+      ${spot(46, 42, 8, 'shoulders')}${spot(74, 42, 8, 'shoulders')}
+      ${spot(52, 54, 9, 'chest')}${spot(68, 54, 9, 'chest')}
+      ${spot(37, 60, 6, 'biceps')}${spot(83, 60, 6, 'biceps')}
+      ${spot(60, 74, 8, 'core')}
+      ${spot(53, 108, 8, 'legs')}${spot(67, 108, 8, 'legs')}
+      <!-- BACK -->
+      ${spot(172, 52, 10, 'back')}${spot(188, 52, 10, 'back')}
+      ${spot(157, 60, 6, 'triceps')}${spot(203, 60, 6, 'triceps')}
+      ${spot(173, 108, 8, 'legs')}${spot(187, 108, 8, 'legs')}
+      <text class="bh-cap" x="60" y="185" text-anchor="middle">VORNE</text>
+      <text class="bh-cap" x="180" y="185" text-anchor="middle">HINTEN</text>
+    </svg>`;
+  }
+
+  return { line, bars, ring, heatCalendar, bodyHeat };
 })();
 
 /* ---- APP: UI controller + live workout ---- */
@@ -372,10 +516,12 @@ const App = (() => {
     rest: { t: 0, iv: null, total: 0 },
     exCache: {},           // id -> exercise
     startFromTemplate: null,
+    suggestByEx: {},       // exId -> overload suggestion
+    settings: { name: 'Sam', haptics: true, sound: false },
   };
 
   // ---------- helpers ----------
-  const vibrate = (ms) => { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} };
+  const vibrate = (ms) => { try { if (S.settings && !S.settings.haptics) return; navigator.vibrate && navigator.vibrate(ms); } catch (e) {} };
   function toast(msg, pr = false) {
     const t = $('toast'); t.textContent = msg; t.className = pr ? 'show pr' : 'show';
     clearTimeout(t._t); t._t = setTimeout(() => (t.className = ''), 1900);
@@ -422,55 +568,189 @@ const App = (() => {
   }
   function render(view) {
     if (view === 'home') renderHome();
+    else if (view === 'training') renderTraining();
     else if (view === 'exercises') renderExercises();
-    else if (view === 'history') renderHistory();
-    else if (view === 'stats') renderStats();
-    else if (view === 'live') renderLive();
+    else if (view === 'progress') renderProgress();
+    else if (view === 'profile') renderProfile();
   }
 
   // ==========================================================
   //  HOME
   // ==========================================================
   async function renderHome() {
+    const name = await DB.metaGet('name', 'Sam');
     const workouts = (await DB.all('workouts'));
     const done = workouts.filter(w => w.status === 'completed').sort((a, b) => b.startTime - a.startTime);
+    const sets = await DB.all('sets');
     const goals = await DB.all('goals');
-    const weekAgo = Date.now() - 7 * 86400000;
+    const bw = (await DB.all('bodyweight')).sort((a, b) => a.ts - b.ts);
+    const now = Date.now(), weekAgo = now - 7 * 86400000;
     const thisWeek = done.filter(w => w.startTime >= weekAgo);
     const active = workouts.find(w => w.status === 'active');
 
+    const h = new Date().getHours();
+    const greet = h < 5 ? 'Late night' : h < 11 ? 'Guten Morgen' : h < 17 ? 'Servus' : h < 22 ? 'Guten Abend' : 'Late night';
+    const streak = computeStreakWeeks(done);
+    const trainedToday = done.some(w => w.date === today());
+    const weekVol = thisWeek.reduce((a, w) => a + (w.totalVolume || 0), 0);
+    const weekSets = thisWeek.reduce((a, w) => a + (w.totalSets || 0), 0);
+
+    // ---------- HERO ----------
     let html = `
-      <div class="metric-grid">
-        <div class="metric"><div class="k">Diese Woche</div><div class="v num">${thisWeek.length}</div><div class="d muted">Workouts</div></div>
-        <div class="metric"><div class="k">Volumen 7T</div><div class="v num">${fmtK(thisWeek.reduce((a, w) => a + (w.totalVolume || 0), 0))}</div><div class="d muted">kg gesamt</div></div>
+      <div class="hero">
+        <div class="hero-grid"></div>
+        <button class="hero-gear" onclick="App.openSettings()" aria-label="Einstellungen">⚙</button>
+        <div class="hero-top">
+          <div class="reactor ${trainedToday ? 'on' : ''}"><span></span></div>
+          <div>
+            <div class="hero-hi">${greet}, <b>${esc(name)}</b></div>
+            <div class="hero-sub">${new Date().toLocaleDateString('de-DE', { weekday: 'long', day: 'numeric', month: 'long' })}</div>
+          </div>
+        </div>
+        <div class="hero-stats">
+          <div><div class="hs-v num" data-count="${thisWeek.length}">0</div><div class="hs-k">Workouts / Woche</div></div>
+          <div><div class="hs-v num" data-count="${weekSets}">0</div><div class="hs-k">Sätze / Woche</div></div>
+          <div><div class="hs-v num" data-count="${streak}">0</div><div class="hs-k">Wochen-Streak ${streak > 0 ? '🔥' : ''}</div></div>
+        </div>
+        <div class="hero-status">${trainedToday
+          ? 'Heute schon trainiert — sauber. Noch eine Einheit?'
+          : (active ? 'Ein Workout läuft noch — mach da weiter.' : 'Noch nicht trainiert heute. Zeit, ranzugehen.')}</div>
       </div>`;
 
+    // ---------- PRIMARY ACTION ----------
     if (active) {
-      html += `<div class="card" style="border-color:var(--up)">
-        <div class="row between"><div><div style="font-weight:800;font-size:17px">Laufendes Workout</div>
-        <div class="muted tiny">gestartet ${new Date(active.startTime).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })}</div></div>
-        <button class="btn up" onclick="App.resumeWorkout()">Weiter</button></div></div>`;
+      html += `<button class="btn up block lg" onclick="App.resumeWorkout()" style="margin:4px 0 8px">▶ Laufendes Workout fortsetzen</button>`;
+    } else {
+      html += `<button class="btn up block lg" onclick="App.startWorkout()" style="margin:4px 0 8px">Workout starten</button>`;
+    }
+    html += `<div class="quickrow">
+        <button class="quick" onclick="App.openTemplates()"><span class="qi">▤</span>Vorlage</button>
+        <button class="quick" onclick="App.openPlateCalc()"><span class="qi">◔</span>Scheiben</button>
+        <button class="quick" onclick="App.openBodyweight()"><span class="qi">⚖</span>Gewicht</button>
+        <button class="quick" onclick="App.go('exercises')"><span class="qi">≣</span>Übungen</button>
+      </div>`;
+
+    // ---------- HEUTE & ZULETZT ----------
+    const last = done[0];
+    let lastHtml;
+    if (last) {
+      const lastSets = sets.filter(s => s.workoutId === last.id);
+      const grps = [...new Set(lastSets.map(s => (S.exCache[s.exerciseId] || {}).muscleGroup).filter(Boolean))]
+        .map(m => DB.MG_LABEL[m]).join(' · ') || '—';
+      lastHtml = `<div class="tl-last" onclick="App.openWorkout('${last.id}')">
+        <div class="row between"><div style="font-weight:700">${esc(last.name || 'Workout')}</div><div class="muted tiny">${dateLabel(last.date)}</div></div>
+        <div class="muted tiny" style="margin:4px 0 8px">${grps}</div>
+        <div class="row" style="gap:16px">
+          <span class="tiny"><b class="num">${last.totalSets || 0}</b> Sätze</span>
+          <span class="tiny"><b class="num">${fmtK(last.totalVolume || 0)}</b> kg</span>
+          <span class="tiny"><b class="num">${dur(last.duration || 0)}</b></span>
+          ${last.prCount ? `<span class="pill pr">${last.prCount} PR</span>` : ''}
+        </div></div>`;
+    } else {
+      lastHtml = `<div class="muted tiny">Noch kein abgeschlossenes Workout.</div>`;
+    }
+    // simple "next" hint: most-neglected group this week
+    let nextHint = '';
+    const under = DB.MUSCLE_GROUPS.filter(m => Logic.landmarkState(m, (Logic.setsPerMuscle(sets, S.exCache, weekAgo)[m] || 0)) === 'low');
+    if (done.length) nextHint = under.length
+      ? `Diese Woche zu kurz gekommen: <b>${under.map(m => DB.MG_LABEL[m]).join(', ')}</b>.`
+      : `Volumen diese Woche gut verteilt. Weiter so.`;
+    html += `<div class="card"><div class="card-h"><span>Heute &amp; zuletzt</span></div>
+      <div class="tl-today">${trainedToday ? '✓ Heute trainiert' : '○ Heute noch offen'}</div>
+      ${lastHtml}
+      ${nextHint ? `<div class="tl-next">↳ ${nextHint}</div>` : ''}</div>`;
+
+    // ---------- WEEKLY CHARTS (real data, last 8 weeks) ----------
+    const weekly = computeWeekly(done, 8);
+    html += `<div class="chart-card"><div class="ct"><span class="title">Einheiten / Woche</span><span class="now num">${thisWeek.length}</span></div>
+      ${Charts.bars(weekly.map(w => ({ label: w.label, value: w.sessions })), { emptyText: 'Noch keine Wochen-Daten' })}</div>`;
+    html += `<div class="chart-card"><div class="ct"><span class="title">Volumen / Woche</span><span class="now num">${fmtK(weekVol)} kg</span></div>
+      ${Charts.bars(weekly.map(w => ({ label: w.label, value: Math.round((w.volume || 0) / 1000) })), { emptyText: 'Noch keine Wochen-Daten' })}</div>
+      <div class="muted tiny" style="margin:-6px 4px 6px">Volumen in Tonnen (×1000 kg)</div>`;
+
+    // ---------- MUSCLE HEATMAP (this week) ----------
+    const spm = Logic.setsPerMuscle(sets, S.exCache, weekAgo);
+    const mrv = {}; for (const m in Logic.LANDMARKS) mrv[m] = Logic.LANDMARKS[m].mrv;
+    html += `<div class="card"><div class="card-h"><span>Muskel-Fokus · 7 Tage</span><span class="muted tiny">Sätze pro Gruppe</span></div>
+      ${Charts.bodyHeat(spm, mrv)}
+      ${landmarkBars(spm)}</div>`;
+
+    // ---------- TRAINING FREQUENCY HEATMAP ----------
+    const dayVol = {};
+    for (const w of done) dayVol[w.date] = (dayVol[w.date] || 0) + (w.totalVolume || 0);
+    html += `<div class="card"><div class="card-h"><span>Trainingsfrequenz · 12 Wochen</span></div>
+      <div class="heatwrap">${Charts.heatCalendar(dayVol, 12)}</div>
+      <div class="heatlegend"><span>weniger</span><i class="heat l0"></i><i class="heat l1"></i><i class="heat l2"></i><i class="heat l3"></i><i class="heat l4"></i><span>mehr</span></div></div>`;
+
+    // ---------- VOLUME TREND ----------
+    const volSeries = [...done].reverse().slice(-14).map(w => ({ x: w.startTime, y: w.totalVolume || 0 }));
+    html += `<div class="chart-card"><div class="ct"><span class="title">Volumen / Workout</span>${done.length ? `<span class="now num">${fmtK(done[0].totalVolume || 0)} kg</span>` : ''}</div>${Charts.line(volSeries, { emptyText: 'Nach dem ersten Workout erscheint hier deine Kurve' })}</div>`;
+
+    // ---------- KEY EXERCISE DEVELOPMENT (e1RM of most-trained lift) ----------
+    const usage = {}; sets.forEach(s => usage[s.exerciseId] = (usage[s.exerciseId] || 0) + 1);
+    const topId = Object.keys(usage).sort((a, b) => usage[b] - usage[a])[0];
+    if (topId && S.exCache[topId]) {
+      const wmap = {}; done.forEach(w => wmap[w.id] = w);
+      const series = Logic.exerciseSeries(sets.filter(s => s.exerciseId === topId), wmap);
+      if (series.length) {
+        html += `<div class="chart-card"><div class="ct"><span class="title">Entwicklung · ${esc(S.exCache[topId].name)}</span><span class="now num">${series[series.length - 1].e1rm} kg</span></div>${Charts.line(series.map(r => ({ x: r.date, y: r.e1rm })))}<div class="muted tiny" style="padding:2px 8px">geschätzter 1RM über Zeit</div></div>`;
+      }
     }
 
-    html += `<button class="btn up block lg" onclick="App.startWorkout()" style="margin:6px 0 4px">Workout starten</button>
-             <div class="row" style="gap:10px;margin-bottom:8px">
-               <button class="btn ghost block" onclick="App.openTemplates()">Aus Vorlage</button>
-               <button class="btn ghost block" onclick="App.go('exercises')">Übungen</button>
-             </div>`;
+    // ---------- BODYWEIGHT (if logged) ----------
+    if (bw.length) {
+      const last = bw[bw.length - 1];
+      const series = bw.map(b => ({ x: b.ts, y: b.kg }));
+      html += `<div class="chart-card"><div class="ct"><span class="title">Körpergewicht</span><span class="now num">${last.kg} kg</span></div>${Charts.line(series)}</div>`;
+    }
 
-    // goals
+    // ---------- RECENT PRs ----------
+    const prs = Logic.recentPRs(sets, S.exCache, 4);
+    if (prs.length) {
+      html += `<h2 class="section">Neueste Rekorde</h2>`;
+      for (const p of prs) html += `<div class="pr-row">
+        <div class="pr-badge">🏆</div>
+        <div class="stack"><div style="font-weight:700">${esc(p.name)}</div><div class="muted tiny">${esc(p.kind)} · ${dateLabel(new Date(p.when).toISOString().slice(0,10))}</div></div>
+        <div class="num pr-val">${p.weight}×${p.reps}</div></div>`;
+    }
+
+    // ---------- GOALS ----------
     if (goals.length) {
       html += `<h2 class="section">Ziele</h2>`;
       for (const g of goals) html += goalCard(g);
     }
 
+    // ---------- RECENT WORKOUTS ----------
     html += `<h2 class="section">Letzte Workouts</h2>`;
     if (!done.length) {
-      html += `<div class="empty"><div class="big">Noch kein Training geloggt</div>Starte dein erstes Workout — Sätze werden lokal auf dem Gerät gespeichert.</div>`;
+      html += `<div class="empty"><div class="big">Bereit für Workout #1</div>${Object.keys(S.exCache).length} Übungen liegen bereit. Starte oben — alles wird lokal gespeichert.</div>`;
     } else {
       for (const w of done.slice(0, 6)) html += workoutRow(w);
     }
+
     $('view-home').innerHTML = html;
+    runCountUps();
+  }
+
+  // sets-per-muscle balance bars vs MEV/MAV/MRV landmarks
+  function landmarkBars(spm) {
+    let out = '<div class="lm">';
+    for (const mg of DB.MUSCLE_GROUPS) {
+      const L = Logic.LANDMARKS[mg]; if (!L) continue;
+      const v = spm[mg] || 0;
+      const state = Logic.landmarkState(mg, v);
+      const pct = Math.min(100, (v / L.mrv) * 100);
+      const mavLo = (L.mav[0] / L.mrv) * 100, mavHi = (L.mav[1] / L.mrv) * 100;
+      out += `<div class="lm-row">
+        <div class="lm-lbl">${DB.MG_LABEL[mg]}</div>
+        <div class="lm-track">
+          <div class="lm-zone" style="left:${mavLo}%;width:${mavHi - mavLo}%"></div>
+          <div class="lm-fill ${state}" style="width:${pct}%"></div>
+        </div>
+        <div class="lm-num num ${state}">${v}</div></div>`;
+    }
+    out += `</div><div class="lm-cap muted tiny">Grünes Feld = produktiver Bereich (MAV). Amber = unter MEV, Rot = über MRV.</div>`;
+    return out;
   }
 
   function goalCard(g) {
@@ -517,8 +797,22 @@ const App = (() => {
       if (tpl) { for (const e of tpl.exercises) await addExercise(e.exerciseId, false); }
       S.startFromTemplate = null;
     }
-    go('live');
+    go('training');
     if (!S.order.length) openExercisePicker();
+  }
+  async function repeatLastWorkout() {
+    await loadExCache();
+    const done = (await DB.all('workouts')).filter(w => w.status === 'completed').sort((a, b) => b.startTime - a.startTime);
+    const last = done[0]; if (!last) return startWorkout();
+    const order = last.exerciseOrder && last.exerciseOrder.length
+      ? last.exerciseOrder
+      : [...new Set((await DB.byIndex('sets', 'workoutId', last.id)).map(s => s.exerciseId))];
+    await startWorkout();
+    for (const id of order) if (S.exCache[id]) await addExercise(id, false);
+    closeSheet();
+    S.curEx = S.order[0] || null;
+    if (S.curEx) { await prefillFromLast(S.curEx); await computeSuggestion(S.curEx); }
+    if (S.view === 'training') { refreshExSwitch(); refreshLiveBody(); }
   }
   function defaultWorkoutName() {
     const h = new Date().getHours();
@@ -534,22 +828,49 @@ const App = (() => {
     for (const s of sets) (S.setsByEx[s.exerciseId] ||= []).push(s);
     S.curEx = S.order[S.order.length - 1] || null;
     if (S.curEx) prefillFromLast(S.curEx);
-    go('live');
+    go('training');
     if (!S.order.length) openExercisePicker();
   }
 
+  // Training tab: live workout if one is active, else a fast start screen
+  async function renderTraining() {
+    if (S.active) { renderLive(); return; }
+    await loadExCache();
+    const done = (await DB.all('workouts')).filter(w => w.status === 'completed').sort((a, b) => b.startTime - a.startTime);
+    const last = done[0];
+    const templates = await DB.all('templates');
+    let html = `<div class="train-start">
+      <div class="ts-icon"><div class="reactor on"><span></span></div></div>
+      <h1 class="ts-h">Bereit?</h1>
+      <p class="ts-sub">Leeres Training starten oder direkt weitermachen.</p>
+      <button class="btn up block lg" onclick="App.startWorkout()">Neues Training starten</button>`;
+    if (last) {
+      const lastSets = (await DB.byIndex('sets', 'workoutId', last.id));
+      const grps = [...new Set(lastSets.map(s => (S.exCache[s.exerciseId] || {}).muscleGroup).filter(Boolean))].map(m => DB.MG_LABEL[m]).join(' · ');
+      html += `<button class="btn ghost block" style="margin-top:10px" onclick="App.repeatLastWorkout()">↺ Letztes wiederholen · ${esc(last.name || 'Workout')}</button>
+        <div class="muted tiny" style="text-align:center;margin-top:6px">${grps || ''}</div>`;
+    }
+    if (templates.length) {
+      html += `<h2 class="section" style="text-align:center">Vorlagen</h2><div class="ts-tpls">`;
+      for (const t of templates.slice(0, 6)) html += `<button class="ts-tpl" onclick="App.runTemplate('${t.id}')">${esc(t.name)}<span class="muted tiny">${(t.exercises || []).length} Übungen</span></button>`;
+      html += `</div>`;
+    }
+    html += `</div>`;
+    $('view-training').innerHTML = html;
+  }
+
   function renderLive() {
-    if (!S.active) { go('home'); return; }
+    if (!S.active) { renderTraining(); return; }
     const elapsed = Date.now() - S.active.startTime;
     let html = `
       <div class="live-head">
-        <button class="btn ghost" style="min-height:40px;padding:0 14px" onclick="App.minimizeWorkout()">‹ Fertig? nein</button>
+        <button class="btn ghost" style="min-height:40px;padding:0 14px" onclick="App.minimizeWorkout()">‹ Pause</button>
         <div class="live-timer">Dauer <span class="num" id="liveDur">${dur(elapsed)}</span></div>
         <button class="btn up" style="min-height:40px;padding:0 16px" onclick="App.finishWorkout()">Beenden</button>
       </div>
       <div class="ex-switch" id="exSwitch">${exSwitchHTML()}</div>
       <div class="live-body" id="liveBody">${liveBodyHTML()}</div>`;
-    $('view-live').innerHTML = html;
+    $('view-training').innerHTML = html;
     startLiveTimer();
   }
 
@@ -573,6 +894,11 @@ const App = (() => {
     const e = ex(S.curEx);
     const sets = S.setsByEx[S.curEx] || [];
     const hintHTML = renderHintHTML(S.curEx);
+    const sug = S.suggestByEx[S.curEx];
+    const sugHTML = sug ? `<div class="hint sug">
+      <svg class="ic" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg>
+      <div class="txt"><b>Vorschlag: ${sug.weight} kg × ${sug.reps}</b> — ${esc(sug.text)}
+      <button class="mini" onclick="App.applySuggestion()">Übernehmen</button></div></div>` : '';
 
     let logs = '';
     sets.forEach((s, i) => {
@@ -592,6 +918,7 @@ const App = (() => {
     return `
       <div class="cur-ex-name">${esc(e.name)}</div>
       <div class="muted tiny">${DB.MG_LABEL[e.muscleGroup]} · Ziel ${e.defaultRepRange.min}–${e.defaultRepRange.max} Wdh.</div>
+      ${sugHTML}
       ${hintHTML}
       <div class="set-log">${logs || '<div class="muted tiny" style="padding:8px 2px">Noch keine Sätze — trag den ersten ein.</div>'}</div>
 
@@ -642,8 +969,8 @@ const App = (() => {
   }
   function setType(t) { S.entry.setType = t; refreshLiveBody(); }
 
-  function selectEx(id) {
-    S.curEx = id; prefillFromLast(id);
+  async function selectEx(id) {
+    S.curEx = id; await prefillFromLast(id); await computeSuggestion(id);
     refreshExSwitch(); refreshLiveBody();
   }
   async function prefillFromLast(id) {
@@ -689,8 +1016,8 @@ const App = (() => {
 
     // feedback
     if (prFlags.length) {
-      toast('🏆 ' + Logic.PR_LABEL[prFlags[0]], true); vibrate([20, 40, 20]);
-    } else { vibrate(12); }
+      showPR(prFlags, set, (ex(S.curEx) || {}).name || 'Übung');
+    } else { vibrate(12); beep(620); }
 
     // auto rest timer + auto-advance to next set (same values pre-filled)
     startRest(en.setType === 'warmup' ? 45 : 120);
@@ -740,31 +1067,50 @@ const App = (() => {
   }
   function stopLiveTimer() { if (S._liveIv) clearInterval(S._liveIv); S._liveIv = null; }
 
-  // ---- rest timer ----
+  // ---- rest timer (reactor ring) ----
   function startRest(sec) {
     S.rest.total = sec; S.rest.t = sec;
     const strip = $('restStrip'); strip.classList.add('show');
-    renderRest();
+    strip.innerHTML = `
+      <div class="rest-ring-wrap">${Charts.ring(sec, sec, false)}</div>
+      <div class="rest-ctrls">
+        <div class="rest-cap">PAUSE</div>
+        <div class="row" style="gap:8px">
+          <button class="btn ghost rest-btn" onclick="App.addRest(15)">+15s</button>
+          <button class="btn ghost rest-btn" onclick="App.addRest(30)">+30s</button>
+          <button class="btn up rest-btn" onclick="App.skipRest()">Skip</button>
+        </div>
+      </div>`;
     if (S.rest.iv) clearInterval(S.rest.iv);
     S.rest.iv = setInterval(() => {
       S.rest.t--;
       if (S.rest.t <= 0) { finishRest(); return; }
-      renderRest();
+      updateRing();
     }, 1000);
   }
-  function renderRest() {
+  function updateRing() {
     const strip = $('restStrip');
-    strip.classList.toggle('warn', S.rest.t <= 10);
-    $('restT').textContent = clock(S.rest.t);
+    const svg = strip.querySelector('svg.ring'); if (!svg) return;
+    const R = 46, C = 2 * Math.PI * R;
+    const pct = S.rest.total > 0 ? Math.max(0, Math.min(1, S.rest.t / S.rest.total)) : 0;
+    const off = (C * (1 - pct)).toFixed(1);
+    svg.querySelectorAll('.ring-prog, .ring-glow').forEach(c => c.setAttribute('stroke-dashoffset', off));
+    const lbl = svg.querySelector('.ring-label'); if (lbl) lbl.textContent = clock(S.rest.t);
+    svg.classList.toggle('warn', S.rest.t <= 10);
   }
-  function addRest(d) { S.rest.t = Math.max(1, S.rest.t + d); renderRest(); }
+  function addRest(d) {
+    S.rest.t = Math.max(1, S.rest.t + d);
+    S.rest.total = Math.max(S.rest.total, S.rest.t);
+    updateRing();
+  }
   function finishRest() {
     if (S.rest.iv) clearInterval(S.rest.iv);
     S.rest.iv = null;
-    vibrate([30, 60, 30]);
-    const strip = $('restStrip'); strip.classList.remove('warn');
-    $('restT').textContent = 'Los!';
-    setTimeout(() => strip.classList.remove('show'), 1200);
+    vibrate([30, 60, 30]); beep(880);
+    const strip = $('restStrip');
+    const svg = strip.querySelector('svg.ring');
+    if (svg) { svg.classList.remove('warn'); svg.classList.add('done'); const l = svg.querySelector('.ring-label'); if (l) l.textContent = 'LOS'; }
+    setTimeout(() => strip.classList.remove('show'), 1300);
   }
   function skipRest() { if (S.rest.iv) clearInterval(S.rest.iv); $('restStrip').classList.remove('show'); }
 
@@ -828,9 +1174,9 @@ const App = (() => {
   }
   async function addExercise(id, select) {
     if (!S.order.includes(id)) S.order.push(id);
-    if (select || !S.curEx) { S.curEx = id; await prefillFromLast(id); }
+    if (select || !S.curEx) { S.curEx = id; await prefillFromLast(id); await computeSuggestion(id); }
     if (S.active) { S.active.exerciseOrder = S.order; await DB.put('workouts', S.active); }
-    if (S.view === 'live') { refreshExSwitch(); refreshLiveBody(); }
+    if (S.view === 'training') { refreshExSwitch(); refreshLiveBody(); }
   }
 
   // ---- create new exercise ----
@@ -856,7 +1202,7 @@ const App = (() => {
     };
     await DB.put('exercises', e); S.exCache[e.id] = e;
     closeSheet();
-    if (S.view === 'live') { await addExercise(e.id, true); }
+    if (S.view === 'training') { await addExercise(e.id, true); }
     else if (S.view === 'exercises') renderExercises();
     toast('Übung erstellt');
   }
@@ -939,23 +1285,6 @@ const App = (() => {
       <span class="now num">${Math.round(now)} ${unit}</span></div>${Charts.line(points)}</div>`;
   }
 
-  // ==========================================================
-  //  HISTORY
-  // ==========================================================
-  async function renderHistory() {
-    const workouts = (await DB.all('workouts'))
-      .filter(w => w.status === 'completed').sort((a, b) => b.startTime - a.startTime);
-    if (!workouts.length) { $('view-history').innerHTML = '<div class="empty"><div class="big">Noch kein Verlauf</div>Abgeschlossene Workouts erscheinen hier.</div>'; return; }
-    // group by month
-    let html = ''; let curMonth = '';
-    for (const w of workouts) {
-      const m = new Date(w.startTime).toLocaleDateString('de-DE', { month: 'long', year: 'numeric' });
-      if (m !== curMonth) { html += `<h2 class="section">${m}</h2>`; curMonth = m; }
-      html += workoutRow(w);
-    }
-    $('view-history').innerHTML = html;
-  }
-
   async function openWorkout(id) {
     await loadExCache();
     const w = await DB.get('workouts', id);
@@ -982,7 +1311,7 @@ const App = (() => {
     const sets = await DB.byIndex('sets', 'workoutId', id);
     for (const s of sets) await DB.del('sets', s.id);
     await DB.del('workouts', id);
-    closeSheet(); renderHistory(); toast('Gelöscht');
+    closeSheet(); if (S.view==='progress') renderProgress(); toast('Gelöscht');
   }
 
   // ==========================================================
@@ -1061,66 +1390,117 @@ const App = (() => {
   }
 
   // ==========================================================
-  //  STATS
+  //  PROGRESS (charts + history)
   // ==========================================================
   let statsEx = null;
-  async function renderStats() {
+  async function renderProgress() {
     await loadExCache();
     const workouts = (await DB.all('workouts')).filter(w => w.status === 'completed');
     const sets = await DB.all('sets');
     const now = Date.now();
     const weekAgo = now - 7 * 86400000;
-    const monthAgo = now - 30 * 86400000;
 
     const totalVol = workouts.reduce((a, w) => a + (w.totalVolume || 0), 0);
     const weekWorkouts = workouts.filter(w => w.startTime >= weekAgo).length;
     const streak = computeStreakWeeks(workouts);
+    const done = [...workouts].sort((a, b) => b.startTime - a.startTime);
 
-    // volume over time (per workout)
-    const volSeries = workouts.sort((a, b) => a.startTime - b.startTime)
-      .map(w => ({ x: w.startTime, y: w.totalVolume || 0 }));
-
-    // sets per muscle (7 days)
+    const weekly = computeWeekly(done, 8);
+    const volSeries = [...workouts].sort((a, b) => a.startTime - b.startTime).map(w => ({ x: w.startTime, y: w.totalVolume || 0 }));
     const spm = Logic.setsPerMuscle(sets, S.exCache, weekAgo);
     const barItems = DB.MUSCLE_GROUPS.filter(m => spm[m]).map(m => ({ label: DB.MG_LABEL[m].slice(0, 3), value: spm[m] }));
 
-    // exercise picker for per-exercise charts
     const usage = {}; sets.forEach(s => usage[s.exerciseId] = (usage[s.exerciseId] || 0) + 1);
     const topEx = Object.values(S.exCache).filter(e => usage[e.id]).sort((a, b) => usage[b.id] - usage[a.id]);
-    if (!statsEx && topEx.length) statsEx = topEx[0].id;
+    if ((!statsEx || !usage[statsEx]) && topEx.length) statsEx = topEx[0].id;
 
     let exCharts = '';
     if (statsEx) {
-      const exSets = sets.filter(s => s.exerciseId === statsEx);
       const wmap = {}; workouts.forEach(w => wmap[w.id] = w);
-      const series = Logic.exerciseSeries(exSets, wmap);
+      const series = Logic.exerciseSeries(sets.filter(s => s.exerciseId === statsEx), wmap);
       const chips = topEx.map(e => `<button class="chip ${e.id === statsEx ? 'active' : ''}" onclick="App.setStatsEx('${e.id}')">${esc(e.name)}</button>`).join('');
-      exCharts = `<h2 class="section">Übungs-Progression</h2><div class="chiprow">${chips}</div>`;
+      exCharts = `<h2 class="section">Übungs-Entwicklung</h2><div class="chiprow">${chips}</div>`;
       if (series.length) {
-        exCharts += chartCard('Geschätzter 1RM', series.map(r => ({ x: r.date, y: r.e1rm })), 'kg', series[series.length - 1].e1rm)
-                  + chartCard('Wdh. (Top-Satz)', series.map(r => ({ x: r.date, y: r.topReps })), '', series[series.length - 1].topReps);
+        exCharts += `<div class="chart-card"><div class="ct"><span class="title">Geschätzter 1RM</span><span class="now num">${series[series.length - 1].e1rm} kg</span></div>${Charts.line(series.map(r => ({ x: r.date, y: r.e1rm })))}</div>`
+                  + `<div class="chart-card"><div class="ct"><span class="title">Top-Satz Wdh.</span></div>${Charts.line(series.map(r => ({ x: r.date, y: r.topReps })))}</div>`;
       } else exCharts += '<div class="muted tiny">Noch keine Daten.</div>';
     }
 
-    $('view-stats').innerHTML = `
+    let history = `<h2 class="section">Verlauf</h2>`;
+    if (!done.length) history += `<div class="empty"><div class="big">Noch kein Verlauf</div>Abgeschlossene Workouts erscheinen hier.</div>`;
+    else for (const w of done.slice(0, 20)) history += workoutRow(w);
+
+    $('view-progress').innerHTML = `
       <div class="metric-grid">
         <div class="metric"><div class="k">Workouts gesamt</div><div class="v num">${workouts.length}</div></div>
         <div class="metric"><div class="k">Diese Woche</div><div class="v num">${weekWorkouts}</div></div>
         <div class="metric"><div class="k">Volumen gesamt</div><div class="v num">${fmtK(totalVol)}</div><div class="d muted">kg</div></div>
         <div class="metric"><div class="k">Wochen-Streak</div><div class="v num">${streak}</div><div class="d muted">Wochen in Folge</div></div>
       </div>
+      <div class="chart-card"><div class="ct"><span class="title">Einheiten / Woche</span></div>${Charts.bars(weekly.map(w => ({ label: w.label, value: w.sessions })))}</div>
       <div class="chart-card"><div class="ct"><span class="title">Volumen / Workout</span></div>${Charts.line(volSeries)}</div>
-      <div class="chart-card"><div class="ct"><span class="title">Sätze pro Muskelgruppe · 7 Tage</span></div>${Charts.bars(barItems)}</div>
+      <div class="chart-card"><div class="ct"><span class="title">Sätze / Muskelgruppe · 7 Tage</span></div>${Charts.bars(barItems)}</div>
       ${exCharts}
-      <h2 class="section">Daten</h2>
-      <div class="row" style="gap:10px">
-        <button class="btn ghost block" onclick="App.exportData()">Backup exportieren</button>
-        <button class="btn ghost block" onclick="App.triggerImport()">Import</button>
-      </div>
-      <button class="btn ghost block" style="margin-top:10px" onclick="App.openNewGoal()">Ziel hinzufügen</button>
-      <input type="file" id="importFile" accept="application/json" class="hidden" onchange="App.importData(this.files[0])">`;
+      ${history}`;
   }
-  function setStatsEx(id) { statsEx = id; renderStats(); }
+  function setStatsEx(id) { statsEx = id; renderProgress(); }
+
+  // ==========================================================
+  //  PROFILE (identity + bodyweight + backup)
+  // ==========================================================
+  async function renderProfile() {
+    const s = S.settings;
+    const bw = (await DB.all('bodyweight')).sort((a, b) => b.ts - a.ts);
+    const last = bw[0];
+    const wCount = (await DB.all('workouts')).filter(w => w.status === 'completed').length;
+    $('view-profile').innerHTML = `
+      <div class="hero" style="margin-top:6px">
+        <div class="hero-grid"></div>
+        <div class="hero-top">
+          <div class="reactor on"><span></span></div>
+          <div><div class="hero-hi"><b>${esc(s.name)}</b></div>
+          <div class="hero-sub">${wCount} Workouts · lokal gespeichert</div></div>
+        </div>
+      </div>
+
+      <div class="card"><div class="card-h"><span>Identität</span></div>
+        <div class="field2"><label>Anzeigename</label><input class="text-in" id="pfName" value="${esc(s.name)}"></div>
+        <label class="tog"><span>Haptik (Vibration)</span><input type="checkbox" id="pfHap" ${s.haptics ? 'checked' : ''}></label>
+        <label class="tog"><span>Sound-Feedback</span><input type="checkbox" id="pfSnd" ${s.sound ? 'checked' : ''}></label>
+        <button class="btn up block" style="margin-top:12px" onclick="App.saveProfile()">Speichern</button>
+      </div>
+
+      <div class="card"><div class="card-h"><span>Körpergewicht</span>${last ? `<span class="num" style="color:var(--up)">${last.kg} kg</span>` : ''}</div>
+        <div class="row" style="gap:10px;align-items:flex-end">
+          <div class="field2" style="flex:1"><label>Heute (kg)</label><input class="text-in num" id="pfBw" inputmode="decimal" value="${last ? last.kg : ''}" placeholder="z.B. 74.5"></div>
+          <button class="btn up" style="min-height:56px" onclick="App.saveBodyweight(true)">Log</button>
+        </div>
+        ${bw.length ? `<div style="margin-top:10px">${Charts.line(bw.slice().reverse().map(b => ({ x: b.ts, y: b.kg })))}</div>` : ''}
+      </div>
+
+      <div class="card"><div class="card-h"><span>Werkzeuge</span></div>
+        <button class="btn ghost block" onclick="App.openPlateCalc()">Scheiben-Rechner</button>
+        <button class="btn ghost block" style="margin-top:8px" onclick="App.openNewGoal()">Ziel hinzufügen</button>
+      </div>
+
+      <div class="card"><div class="card-h"><span>Daten &amp; Backup</span></div>
+        <div class="row" style="gap:10px">
+          <button class="btn ghost block" onclick="App.exportData()">Exportieren</button>
+          <button class="btn ghost block" onclick="App.triggerImport()">Import</button>
+        </div>
+        <div class="muted tiny" style="margin-top:10px">Alles liegt offline auf diesem Gerät. Exportiere regelmäßig ein Backup.</div>
+        <input type="file" id="importFile" accept="application/json" class="hidden" onchange="App.importData(this.files[0])">
+      </div>`;
+  }
+  async function saveProfile() {
+    S.settings.name = ($('pfName').value || 'Sam').trim() || 'Sam';
+    S.settings.haptics = $('pfHap').checked;
+    S.settings.sound = $('pfSnd').checked;
+    await DB.metaSet('name', S.settings.name);
+    await DB.metaSet('haptics', S.settings.haptics);
+    await DB.metaSet('sound', S.settings.sound);
+    toast('Gespeichert'); renderProfile();
+  }
   function computeStreakWeeks(workouts) {
     if (!workouts.length) return 0;
     const weeks = new Set(workouts.map(w => weekKey(w.startTime)));
@@ -1154,7 +1534,7 @@ const App = (() => {
       const bundle = JSON.parse(await file.text());
       if (!confirm('Import ersetzt alle aktuellen Daten. Fortfahren?')) return;
       await DB.importAll(bundle, { merge: false });
-      await loadExCache(); toast('Import erfolgreich'); renderStats();
+      await loadExCache(); toast('Import erfolgreich'); go(S.view);
     } catch (e) { toast('Import fehlgeschlagen'); }
   }
 
@@ -1174,15 +1554,182 @@ const App = (() => {
   async function init() {
     if (_booted) return; _booted = true;
     await DB.init();
+    // load settings
+    S.settings.name = await DB.metaGet('name', 'Sam');
+    S.settings.haptics = await DB.metaGet('haptics', true);
+    S.settings.sound = await DB.metaGet('sound', false);
     await loadExCache();
-    // wire tab bar
+    // wire chrome
     document.querySelectorAll('.tabbar button').forEach(b => b.onclick = () => go(b.dataset.view));
-    $('scrim').onclick = closeSheet;
-    $('restSkip').onclick = skipRest;
-    $('restAdd').onclick = () => addRest(15);
-    // resume active workout if present
-    const act = (await DB.all('workouts')).find(w => w.status === 'active');
-    if (act) { go('home'); } else { go('home'); }
+    const scrim = $('scrim'); if (scrim) scrim.onclick = closeSheet;
+    // first paint
+    go('home');
+    // dismiss boot overlay
+    const boot = $('boot');
+    if (boot) {
+      const nm = boot.querySelector('.boot-name'); if (nm) nm.textContent = S.settings.name;
+      setTimeout(() => boot.classList.add('done'), 1100);
+      setTimeout(() => { boot.style.display = 'none'; }, 1900);
+    }
+  }
+
+  // ==========================================================
+  //  DASHBOARD HELPERS / EXTRAS
+  // ==========================================================
+  function computeWeekly(done, weeks) {
+    const out = [];
+    const monday = new Date(); monday.setHours(0, 0, 0, 0);
+    const dow = (monday.getDay() + 6) % 7; monday.setDate(monday.getDate() - dow);
+    for (let i = weeks - 1; i >= 0; i--) {
+      const from = new Date(monday); from.setDate(monday.getDate() - i * 7);
+      const to = new Date(from); to.setDate(from.getDate() + 7);
+      const ws = done.filter(w => w.startTime >= from.getTime() && w.startTime < to.getTime());
+      out.push({ label: `${from.getDate()}.${from.getMonth() + 1}`, sessions: ws.length, volume: ws.reduce((a, w) => a + (w.totalVolume || 0), 0) });
+    }
+    return out;
+  }
+
+  function runCountUps() {
+    const reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+    document.querySelectorAll('#view-home [data-count]').forEach(el => {
+      const to = parseFloat(el.getAttribute('data-count')) || 0;
+      if (reduce || to === 0) { el.textContent = to; return; }
+      const t0 = performance.now(), d = 650;
+      const tick = (t) => {
+        const p = Math.min(1, (t - t0) / d);
+        el.textContent = Math.round(to * (1 - Math.pow(1 - p, 3)));
+        if (p < 1) requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+
+  // optional sound feedback (no files, WebAudio)
+  let _ac = null;
+  function beep(freq = 880) {
+    if (!S.settings || !S.settings.sound) return;
+    try {
+      _ac = _ac || new (window.AudioContext || window.webkitAudioContext)();
+      const o = _ac.createOscillator(), g = _ac.createGain();
+      o.type = 'sine'; o.frequency.value = freq; o.connect(g); g.connect(_ac.destination);
+      g.gain.setValueAtTime(0.0001, _ac.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.18, _ac.currentTime + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, _ac.currentTime + 0.25);
+      o.start(); o.stop(_ac.currentTime + 0.26);
+    } catch (e) {}
+  }
+
+  // full-screen PR moment
+  function showPR(flags, set, exName) {
+    const ov = $('prOverlay'); if (!ov) return;
+    ov.innerHTML = `<div class="pr-card">
+      <div class="pr-badge-xl">🏆</div>
+      <div class="pr-title">NEW RECORD</div>
+      <div class="pr-ex">${esc(exName)}</div>
+      <div class="pr-big num">${set.weight} kg × ${set.reps}</div>
+      <div class="pr-kind">${esc(Logic.PR_LABEL[flags[0]])}${flags.length > 1 ? ` · +${flags.length - 1} weitere` : ''}</div>
+      <div class="pr-tap muted tiny">tippen zum Schließen</div></div>`;
+    ov.classList.add('show');
+    vibrate([20, 40, 20, 40, 60]); beep(1180);
+    clearTimeout(ov._t); ov._t = setTimeout(() => ov.classList.remove('show'), 1700);
+    ov.onclick = () => { clearTimeout(ov._t); ov.classList.remove('show'); };
+  }
+
+  // ---- overload suggestion (pre-fill helper) ----
+  async function computeSuggestion(id) {
+    const e = ex(id); if (!e) { return; }
+    const activeId = S.active && S.active.id;
+    const hist = (await DB.byIndex('sets', 'exerciseId', id)).filter(s => s.workoutId !== activeId);
+    if (!hist.length) { S.suggestByEx[id] = null; return; }
+    const byW = {}; hist.forEach(s => (byW[s.workoutId] ||= []).push(s));
+    const latest = Object.keys(byW).sort((a, b) =>
+      Math.max(...byW[b].map(s => s.timestamp)) - Math.max(...byW[a].map(s => s.timestamp)))[0];
+    S.suggestByEx[id] = Logic.overloadSuggestion(e, byW[latest]);
+  }
+  function applySuggestion() {
+    const sug = S.suggestByEx[S.curEx]; if (!sug) return;
+    S.entry = { weight: sug.weight, reps: sug.reps, rir: sug.rir, setType: 'working' };
+    refreshLiveBody(); toast('Vorschlag übernommen'); vibrate(10);
+  }
+
+  // ==========================================================
+  //  PLATE CALCULATOR + WARMUP RAMP
+  // ==========================================================
+  let _bar = 20;
+  function openPlateCalc() {
+    openSheet(`<div class="grab"></div><h3>Scheiben-Rechner</h3>
+      <div class="row" style="gap:10px">
+        <div class="field2"><label>Zielgewicht</label><input class="text-in num" id="pcTarget" inputmode="decimal" value="60" oninput="App.calcPlates()"></div>
+        <div class="field2"><label>Stange (kg)</label><input class="text-in num" id="pcBar" inputmode="decimal" value="${_bar}" oninput="App.calcPlates()"></div>
+      </div>
+      <div id="pcOut" class="pc-out"></div>
+      <h3 style="margin-top:20px">Aufwärm-Rampe</h3>
+      <div id="pcWarm" class="pc-warm"></div>`);
+    calcPlates();
+  }
+  function calcPlates() {
+    const target = parseFloat(($('pcTarget').value || '0').replace(',', '.')) || 0;
+    const bar = parseFloat(($('pcBar').value || '20').replace(',', '.')) || 20; _bar = bar;
+    const perSide = (target - bar) / 2;
+    const out = $('pcOut');
+    if (perSide < 0) out.innerHTML = `<div class="muted tiny">Ziel liegt unter dem Stangengewicht.</div>`;
+    else {
+      const plates = [25, 20, 15, 10, 5, 2.5, 1.25]; let rem = perSide; const used = [];
+      for (const p of plates) { const n = Math.floor(rem / p + 1e-9); if (n > 0) { used.push([p, n]); rem -= n * p; } }
+      const chips = used.map(([p, n]) => `<span class="plate">${n}×${p}</span>`).join('') || '<span class="muted tiny">nur Stange</span>';
+      const rest = rem > 0.01 ? `<div class="muted tiny">Rest ${Math.round(rem * 100) / 100} kg nicht darstellbar</div>` : '';
+      out.innerHTML = `<div class="muted tiny">pro Seite ${Math.round(perSide * 100) / 100} kg</div><div class="plates">${chips}</div>${rest}`;
+    }
+    const warm = $('pcWarm');
+    if (target > bar) {
+      const steps = [['Stange', bar], ['40%', bar + (target - bar) * 0.4], ['60%', bar + (target - bar) * 0.6], ['80%', bar + (target - bar) * 0.8], ['Arbeit', target]];
+      warm.innerHTML = steps.map(([l, w]) => `<div class="warm-row"><span>${l}</span><b class="num">${Math.round(w / 2.5) * 2.5} kg</b></div>`).join('');
+    } else warm.innerHTML = `<div class="muted tiny">—</div>`;
+  }
+
+  // ==========================================================
+  //  BODYWEIGHT
+  // ==========================================================
+  async function openBodyweight() {
+    const bw = (await DB.all('bodyweight')).sort((a, b) => b.ts - a.ts);
+    const last = bw[0];
+    const list = bw.slice(0, 10).map(b => `<div class="list-item"><div class="name num">${b.kg} kg</div><div class="mg">${dateLabel(b.date)}</div></div>`).join('') || '<div class="muted tiny">Noch nichts geloggt.</div>';
+    openSheet(`<div class="grab"></div><h3>Körpergewicht</h3>
+      <div class="row" style="gap:10px;align-items:flex-end">
+        <div class="field2" style="flex:1"><label>Heute (kg)</label><input class="text-in num" id="bwIn" inputmode="decimal" value="${last ? last.kg : ''}" placeholder="z.B. 74.5"></div>
+        <button class="btn up" style="min-height:56px" onclick="App.saveBodyweight()">Speichern</button>
+      </div>
+      <h3 style="margin-top:18px">Verlauf</h3>${list}`);
+  }
+  async function saveBodyweight(fromProfile) {
+    const el = fromProfile ? $('pfBw') : $('bwIn');
+    const v = parseFloat(((el && el.value) || '').replace(',', '.'));
+    if (!v || v < 20 || v > 400) { toast('Ungültiges Gewicht'); return; }
+    await DB.put('bodyweight', { id: DB.uid('bw_'), ts: Date.now(), date: today(), kg: Math.round(v * 10) / 10 });
+    toast('Gewicht gespeichert');
+    if (fromProfile) renderProfile(); else { closeSheet(); renderHome(); }
+  }
+
+  // ==========================================================
+  //  SETTINGS (name, haptics, sound)
+  // ==========================================================
+  function openSettings() {
+    const s = S.settings;
+    openSheet(`<div class="grab"></div><h3>Einstellungen</h3>
+      <div class="field2"><label>Anzeigename</label><input class="text-in" id="setName" value="${esc(s.name)}"></div>
+      <label class="tog"><span>Haptik (Vibration)</span><input type="checkbox" id="setHap" ${s.haptics ? 'checked' : ''}></label>
+      <label class="tog"><span>Sound-Feedback</span><input type="checkbox" id="setSnd" ${s.sound ? 'checked' : ''}></label>
+      <button class="btn up block" style="margin-top:16px" onclick="App.saveSettings()">Speichern</button>
+      <div class="muted tiny" style="margin-top:14px;text-align:center">Alle Daten liegen lokal auf diesem Gerät.</div>`);
+  }
+  async function saveSettings() {
+    S.settings.name = ($('setName').value || 'Sam').trim() || 'Sam';
+    S.settings.haptics = $('setHap').checked;
+    S.settings.sound = $('setSnd').checked;
+    await DB.metaSet('name', S.settings.name);
+    await DB.metaSet('haptics', S.settings.haptics);
+    await DB.metaSet('sound', S.settings.sound);
+    closeSheet(); renderHome();
   }
 
   return {
@@ -1192,8 +1739,10 @@ const App = (() => {
     setExFilter, openExercise, openWorkout, deleteWorkout,
     openTemplates, runTemplate, saveAsTemplate,
     openNewGoal, goalTypeChanged, saveGoal, editGoal,
-    renderStats, setStatsEx, exportData, triggerImport, importData,
-    // rest strip
+    renderProgress, renderProfile, saveProfile, setStatsEx, exportData, triggerImport, importData, repeatLastWorkout,
+    addRest, skipRest, applySuggestion,
+    openPlateCalc, calcPlates, openBodyweight, saveBodyweight,
+    openSettings, saveSettings,
   };
 })();
 
